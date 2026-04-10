@@ -2695,17 +2695,39 @@ def prompt_and_act(prompt: str, use_api: bool = False) -> dict:
             if output_mode_manager.verbose:
                 print(f"Will continue executing until task appears complete (max {max_iterations} iterations)")
 
+            # Track executed actions for context and deduplication
+            executed_actions_summary = []
+            executed_action_hashes = set()  # Prevent repeating same action
+
             while iteration < max_iterations:
                 iteration += 1
 
                 if iteration > 1:
+                    # Build context of what has been done so far
+                    context_so_far = ""
+                    if executed_actions_summary:
+                        context_so_far = "Actions already completed:\n" + "\n".join(executed_actions_summary) + "\n\n"
+
                     # Get LLM response for continuation
                     continuation_prompt = f"""
 Previous request: {prompt}
-Last action completed. Should I continue with more actions to complete the task?
-If yes, output the next action(s) in [TOOL] format.
-If the task is complete, output [TASK_COMPLETE] with a brief summary.
+
+{context_so_far}Based on the original request and what has been done, what is the NEXT action(s) needed?
+
+CRITICAL RULES:
+1. CHECK BEFORE CREATING: Before creating any file/folder, check if it already exists. If a React app folder exists (my-app, react-app, src/, etc.), DO NOT create another one.
+2. DO NOT REPEAT: Never repeat an action already in the "completed" list above.
+3. DECLARE COMPLETE EARLY: If the main goal is achieved (e.g., a working React app exists), output [TASK_COMPLETE] immediately - don't keep adding more.
+4. AVOID REDUNDANT LISTING: Do NOT list the same directory twice. If you already listed a directory, use that knowledge.
+5. SINGLE FOLDER RULE: For "add react project", create ONLY ONE folder (preferably named "react-app" or "my-app"), not multiple.
+
+RESPONSE FORMAT:
+- If task is COMPLETE: [TASK_COMPLETE] Brief summary [/TASK_COMPLETE]
+- If MORE actions needed: Output [TOOL] tags for each action
 """
+                    if output_mode_manager.verbose:
+                        print(f"\n[Continuation {iteration}/{max_iterations}] Determining next actions...")
+
                     if use_api:
                         response = run_ollama_chat([{"role": "user", "content": continuation_prompt}], stream=stream)
                     else:
@@ -2728,6 +2750,14 @@ If the task is complete, output [TASK_COMPLETE] with a brief summary.
                 batch_successful = 0
 
                 for i, action in enumerate(actions):
+                    # Create a hash of this action to detect duplicates
+                    action_hash = f"{action.get('tool')}:{action.get('parameters', {})}"
+                    if action_hash in executed_action_hashes:
+                        if output_mode_manager.verbose:
+                            print(f"[Skipping duplicate action] {action_hash[:80]}")
+                        continue
+                    executed_action_hashes.add(action_hash)
+
                     # Check permission for file operations (Claude-like)
                     if action.get("tool") in ["write_file", "edit_file", "delete_file"]:
                         has_perm, reason = permission_manager.check_permission(action)
@@ -2760,6 +2790,18 @@ If the task is complete, output [TASK_COMPLETE] with a brief summary.
                         if tool_result.success:
                             batch_successful += 1
                             total_successful += 1
+                            # Track executed action for continuation context
+                            tool_name = action.get("tool", "unknown")
+                            params = action.get("parameters", {})
+                            filepath = params.get("filepath", "")
+                            if tool_name == "write_file":
+                                executed_actions_summary.append(f"- Created file: {filepath}")
+                            elif tool_name == "edit_file":
+                                executed_actions_summary.append(f"- Modified file: {filepath}")
+                            elif tool_name == "list_directory":
+                                executed_actions_summary.append(f"- Listed directory: {params.get('path', '')}")
+                            elif tool_name == "read_file":
+                                executed_actions_summary.append(f"- Read file: {filepath}")
                             if output_mode_manager.verbose:
                                 print(f"[Success] {tool_result.output[:150] if tool_result.output else 'Done'}")
                         else:
