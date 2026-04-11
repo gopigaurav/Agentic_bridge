@@ -1,5 +1,5 @@
 """
-Agentic Bridge - Local AI Agent for qwen2.5-coder
+Agentic Bridge - Local AI Agent for qwen3.5/2.5-coder/glm-4.7-flash
 ==================================================
 A complete agentic AI system that allows local LLM models to perform actions
 similar to Claude/GitHub Copilot.
@@ -94,6 +94,8 @@ except ImportError:
 # --- CONFIG ---
 # Configuration for connecting to Ollama LLM server
 OLLAMA_MODEL = "qwen3.5"  # The LLM model name to use
+# OLLAMA_MODEL = "qwen2.5-coder"  # The LLM model name to use
+# OLLAMA_MODEL = "glm-4.7-flash"  # The LLM model name to use
 OLLAMA_API_URL = "http://localhost:11434/api/generate"  # Endpoint for text generation (streaming)
 CHAT_API_URL = "http://localhost:11434/api/chat"  # Endpoint for chat-based interactions
 
@@ -921,43 +923,51 @@ class AgenticLoop:
 
     def _build_loop_prompt(self) -> str:
         """Build the prompt for the agentic loop."""
+
+        observations = ""
+        if hasattr(self, 'last_observation') and self.last_observation:
+            observations = f"\nLAST OBSERVATION:\n{self.last_observation}\n"
+
         context = f"""
-GOAL: {self.goal}
+            GOAL: {self.goal}
 
-ITERATION: {self.iteration + 1}/{self.max_iterations}
+            ITERATION: {self.iteration + 1}/{self.max_iterations}
 
-COMPLETED STEPS:
-{chr(10).join(self.completed_steps) if self.completed_steps else "(none yet)"}
+            COMPLETED STEPS:
+            {chr(10).join(self.completed_steps) if self.completed_steps else "(none yet)"}
 
-FAILED STEPS:
-{chr(10).join(self.failed_steps) if self.failed_steps else "(none yet)"}
-{f'LAST ERROR: {self.last_error}' if self.last_error else ''}
+            LAST STEP OBSERVATION:
+            {self.last_observation if hasattr(self, 'last_observation') and self.last_observation else "(no output yet)"}
 
-CURRENT STATE:
-- Working directory: {os.getcwd()}
-- Files modified this session: {git_integration.modified_files[-5:] if git_integration.modified_files else "(none)"}
+            FAILED STEPS:
+            {chr(10).join(self.failed_steps) if self.failed_steps else "(none yet)"}
+            {f'LAST ERROR: {self.last_error}' if self.last_error else ''}
 
-INSTRUCTIONS:
-You are working autonomously toward the goal above.
+            CURRENT STATE:
+            - Working directory: {os.getcwd()}
+            - Files modified this session: {git_integration.modified_files[-5:] if git_integration.modified_files else "(none)"}
 
-Think step by step:
-1. What has been accomplished?
-2. What still needs to be done?
-3. Is the goal complete? If yes, output [GOAL_COMPLETE] with a summary.
-4. If not complete, what is the NEXT SINGLE STEP to take?
+            INSTRUCTIONS:
+            You are working autonomously toward the goal above.
 
-Output format for next action:
-[TOOL tool_name]
-{{"param": "value"}}
-[/TOOL]
+            Think step by step:
+            1. What has been accomplished?
+            2. What still needs to be done?
+            3. Is the goal complete? If yes, output [GOAL_COMPLETE] with a summary.
+            4. If not complete, what is the NEXT SINGLE STEP to take?
 
-Or if goal is complete:
-[GOAL_COMPLETE]
-Summary of what was accomplished...
-[/GOAL_COMPLETE]
+            Output format for next action:
+            [TOOL tool_name]
+            {{"param": "value"}}
+            [/TOOL]
 
-IMPORTANT: Take ONE step at a time. After each step, you will see the result and decide what to do next.
-"""
+            Or if goal is complete:
+            [GOAL_COMPLETE]
+            Summary of what was accomplished...
+            [/GOAL_COMPLETE]
+
+            IMPORTANT: Take ONE step at a time. After each step, you will see the result and decide what to do next.
+            """
         return context
 
     def _check_goal_complete(self, llm_response: str) -> Tuple[bool, str]:
@@ -1312,9 +1322,15 @@ class WriteFileTool(Tool):
             if parent_dir and not os.path.exists(parent_dir):
                 os.makedirs(parent_dir, exist_ok=True)
 
+            # Check if file exists (overwrite vs create)
+            is_overwrite = os.path.exists(filepath)
+
             # Feature 2: Save undo state if file exists (modification)
-            if os.path.exists(filepath):
+            if is_overwrite:
                 undo_manager.save_file_state(filepath)
+                old_content = open(filepath, "r", encoding="utf-8").read()
+            else:
+                old_content = ""
 
             with open(filepath, "w", encoding="utf-8") as f:
                 f.write(content)
@@ -1325,9 +1341,15 @@ class WriteFileTool(Tool):
             # Git integration: track modification
             git_integration.track_file_modification(filepath)
 
+            # Show Claude-like diff display
+            if is_overwrite:
+                DiffDisplay.show_file_edited(filepath, old_content, content)
+            else:
+                DiffDisplay.show_file_created(filepath, content)
+
             return ToolResult(
                 success=True,
-                output=f"File created: {filepath}",
+                output=f"File {'overwritten' if is_overwrite else 'created'}: {filepath}",
                 data={"filepath": filepath, "bytes_written": len(content)}
             )
         except Exception as e:
@@ -1402,6 +1424,9 @@ class EditFileTool(Tool):
 
             # Git integration: track modification
             git_integration.track_file_modification(filepath)
+
+            # Show Claude-like diff display
+            DiffDisplay.show_file_edited(filepath, original_content, new_content)
 
             return ToolResult(
                 success=True,
@@ -1787,15 +1812,27 @@ def parse_all_actions_from_response(response: str) -> List[Dict[str, Any]]:
         # Try to parse parameters as JSON
         try:
             params = json.loads(params_text)
+            # Validate that required fields exist for known tools
+            if tool_name == "edit_file" and "filepath" not in params:
+                print(f"[Warning] Skipping incomplete {tool_name} action - missing filepath")
+                continue
+            if tool_name in ["write_file", "read_file", "delete_file"] and "filepath" not in params:
+                print(f"[Warning] Skipping incomplete {tool_name} action - missing filepath")
+                continue
             actions.append({"type": "tool", "tool": tool_name, "parameters": params})
-        except json.JSONDecodeError:
-            # Fallback: parse key=value pairs
-            params = {}
-            for line in params_text.split("\n"):
-                if "=" in line:
-                    key, value = line.split("=", 1)
-                    params[key.strip()] = value.strip()
-            actions.append({"type": "tool", "tool": tool_name, "parameters": params})
+        except json.JSONDecodeError as e:
+            # Check if JSON is truncated (incomplete)
+            if params_text.endswith('"') or params_text.endswith('}'):
+                # Try fallback: parse key=value pairs
+                params = {}
+                for line in params_text.split("\n"):
+                    if "=" in line:
+                        key, value = line.split("=", 1)
+                        params[key.strip()] = value.strip()
+                if params:
+                    actions.append({"type": "tool", "tool": tool_name, "parameters": params})
+            else:
+                print(f"[Warning] Skipping malformed {tool_name} action - incomplete JSON: {params_text[:50]}...")
 
     # Find all [RUN]...[/RUN] tags
     run_pattern = r"\[RUN\](.*?)\[/RUN\]"
@@ -2065,38 +2102,51 @@ def run_ollama_generate(prompt: str, stream: bool = True) -> str:
     payload = {
         "model": OLLAMA_MODEL,
         "prompt": full_prompt,
-        "stream": True,  # Always stream for complete responses
+        "stream": False,  # Disable streaming for complete responses (avoid truncation)
         "options": {
-            "num_predict": 8192,  # Max tokens for long responses
+            "num_predict": 16384,  # Max tokens for long responses (increased for file edits)
             "temperature": 0.7,
         }
     }
 
     output = ""
     if HAS_REQUESTS:
-        resp = requests.post(OLLAMA_API_URL, json=payload, stream=True)
+        resp = requests.post(OLLAMA_API_URL, json=payload, timeout=120)
         resp.raise_for_status()
-        for line in resp.iter_lines():
-            if line:
-                data = json.loads(line)
-                chunk = data.get("response", "")
-                if stream:
-                    print(chunk, end="", flush=True)
-                output += chunk
+        data = resp.json()
+        output = data.get("response", "")
+        if stream and output:
+            print(output, end="", flush=True)
     else:
         req = urllib.request.Request(
             OLLAMA_API_URL,
             data=json.dumps(payload).encode(),
             headers={"Content-Type": "application/json"}
         )
-        with urllib.request.urlopen(req) as resp:
-            for line in resp:
-                if line:
-                    data = json.loads(line.decode())
-                    chunk = data.get("response", "")
-                    if stream:
-                        print(chunk, end="", flush=True)
-                    output += chunk
+        with urllib.request.urlopen(req, timeout=120) as resp:
+            data = json.loads(resp.read().decode())
+            output = data.get("response", "")
+            if stream and output:
+                print(output, end="", flush=True)
+
+    # Check if response seems truncated (incomplete JSON inside [TOOL] tags, unclosed tags)
+    if output:
+        # Check for unclosed [TOOL] tags
+        open_tags = len(re.findall(r'\[TOOL\s+\w+\]', output)) - len(re.findall(r'\[/TOOL\]', output))
+        # Check for incomplete JSON inside [TOOL] tags (JSON that doesn't end with })
+        tool_matches = re.findall(r'\[TOOL\s+\w+\](.*?)(?:\[/TOOL\]|$)', output, re.DOTALL)
+        incomplete_json = False
+        for tool_content in tool_matches:
+            tool_content = tool_content.strip()
+            if tool_content and not tool_content.endswith('}'):
+                incomplete_json = True
+                break
+
+        if open_tags > 0 or incomplete_json:
+            print("\n[Warning] Response appears truncated, requesting continuation...")
+            continuation = run_ollama_generate("Continue from where you left off. Complete the JSON/tool tags.", stream=False)
+            output += continuation
+
     return output
 
 
@@ -2359,6 +2409,66 @@ def auto_read_file_before_edit(prompt: str) -> Optional[str]:
 
 
 # =============================================================================
+# DIFF DISPLAY - Claude-like showing of added/removed lines
+# =============================================================================
+
+class DiffDisplay:
+    """Display file changes in a Claude-like format with +/- prefixes."""
+
+    @staticmethod
+    def show_file_created(filepath: str, content: str, context_lines: int = 50):
+        """Display a newly created file with + prefix for all lines."""
+        print(f"\n{'='*60}")
+        print(f"[CREATE] {filepath}")
+        print(f"{'='*60}")
+        lines = content.splitlines()[:context_lines]
+        for line in lines:
+            print(f"\033[32m+\033[0m {line}")  # Green for added
+        if len(content.splitlines()) > context_lines:
+            print(f"  ... and {len(content.splitlines()) - context_lines} more lines")
+        print(f"{'='*60}\n")
+
+    @staticmethod
+    def show_file_edited(filepath: str, old_content: str, new_content: str, context_lines: int = 3):
+        """Display file edits with +/- prefixes for changed lines."""
+        import difflib
+
+        old_lines = old_content.splitlines()
+        new_lines = new_content.splitlines()
+
+        diff = difflib.unified_diff(old_lines, new_lines, lineterm='', n=context_lines)
+        diff_lines = list(diff)
+
+        if not diff_lines:
+            return  # No changes
+
+        print(f"\n{'='*60}")
+        print(f"[EDIT] {filepath}")
+        print(f"{'='*60}")
+
+        added_count = 0
+        removed_count = 0
+
+        for line in diff_lines:
+            if line.startswith('---') or line.startswith('+++'):
+                continue  # Skip header lines
+            elif line.startswith('@@'):
+                # Show hunk header
+                print(f"\n{line}")
+            elif line.startswith('-'):
+                print(f"\033[31m{line}\033[0m")  # Red for removed
+                removed_count += 1
+            elif line.startswith('+'):
+                print(f"\033[32m{line}\033[0m")  # Green for added
+                added_count += 1
+            else:
+                print(f" {line}")  # Context lines
+
+        print(f"\nSummary: +{added_count} lines, -{removed_count} lines")
+        print(f"{'='*60}\n")
+
+
+# =============================================================================
 # GOAL/STEP TRACKER - Visual progress tracking (Claude-like)
 # =============================================================================
 
@@ -2444,6 +2554,9 @@ class PermissionManager:
         """
         Check if an action has permission.
         Returns (has_permission, reason)
+
+        For write_file, edit_file, delete_file: ALWAYS require explicit user permission
+        unless the file pattern is in allowed_always.
         """
         if action.get("type") != "tool":
             return True, ""
@@ -2451,11 +2564,11 @@ class PermissionManager:
         tool = action.get("tool")
         params = action.get("parameters", {})
 
-        # Check file operations
+        # Check file operations - ALWAYS require permission unless explicitly allowed
         if tool in ["write_file", "edit_file", "delete_file"]:
             filepath = params.get("filepath", "")
 
-            # Check "allow always" patterns
+            # Check "allow always" patterns first
             for pattern in self.allowed_always:
                 if self._matches_pattern(filepath, pattern):
                     return True, f"Allowed by pattern: {pattern}"
@@ -2465,7 +2578,10 @@ class PermissionManager:
                 if self._matches_pattern(filepath, pattern):
                     return False, f"Denied by pattern: {pattern}"
 
-        return True, ""  # Default: allow (will ask user first time)
+            # NOT in allowed_always - must ask user
+            return False, "Requires user permission"
+
+        return True, ""
 
     def _matches_pattern(self, filepath: str, pattern: str) -> bool:
         """Check if filepath matches a glob pattern."""
@@ -2530,6 +2646,98 @@ class PermissionManager:
 permission_manager = PermissionManager()
 
 
+# =============================================================================
+# VOICE ASSISTANT - Text-to-Speech and Speech-to-Text
+# =============================================================================
+
+class VoiceAssistant:
+    """Voice input/output support using pyttsx3 and speech_recognition."""
+
+    def __init__(self):
+        self.enabled = False
+        self.tts_engine = None
+        self.speech_recognizer = None
+        self._init_tts()
+
+    def _init_tts(self):
+        """Initialize text-to-speech engine."""
+        try:
+            import pyttsx3
+            self.tts_engine = pyttsx3.init()
+            self.tts_engine.setProperty('rate', 150)  # Speed
+            self.tts_engine.setProperty('volume', 0.9)  # Volume
+        except ImportError:
+            print("[Voice] pyttsx3 not installed. Run: pip install pyttsx3")
+            self.tts_engine = None
+        except Exception as e:
+            print(f"[Voice] TTS initialization error: {e}")
+            self.tts_engine = None
+
+    def speak(self, text: str):
+        """Speak text using TTS."""
+        if not self.enabled or not self.tts_engine:
+            return
+
+        try:
+            # Clean up markdown and special characters for speech
+            clean_text = text
+            clean_text = re.sub(r'\[.*?\]', '', clean_text)  # Remove [TOOL] tags
+            clean_text = re.sub(r'```.*?```', '', clean_text, flags=re.DOTALL)  # Remove code blocks
+            clean_text = re.sub(r'[#*_`]', '', clean_text)  # Remove markdown chars
+
+            self.tts_engine.say(clean_text)
+            self.tts_engine.runAndWait()
+        except Exception as e:
+            print(f"[Voice] Speak error: {e}")
+
+    def listen(self, timeout: int = 5) -> str:
+        """Listen for voice input."""
+        try:
+            import speech_recognition as sr
+
+            if not self.speech_recognizer:
+                self.speech_recognizer = sr.Recognizer()
+
+            with sr.Microphone() as source:
+                print("[Voice] Listening... (speak now)")
+                self.speech_recognizer.adjust_for_ambient_noise(source, duration=0.5)
+                audio = self.speech_recognizer.listen(source, timeout=timeout)
+
+            print("[Voice] Recognizing...")
+            try:
+                # Try Google Speech Recognition (free, no API key needed)
+                text = self.speech_recognizer.recognize_google(audio)
+                print(f"[Voice] You said: {text}")
+                return text
+            except sr.UnknownValueError:
+                print("[Voice] Could not understand audio")
+                return ""
+            except sr.RequestError as e:
+                print(f"[Voice] Recognition service error: {e}")
+                return ""
+
+        except ImportError:
+            print("[Voice] speech_recognition not installed. Run: pip install SpeechRecognition")
+            return ""
+        except Exception as e:
+            print(f"[Voice] Listen error: {e}")
+            return ""
+
+    def toggle(self):
+        """Toggle voice mode on/off."""
+        self.enabled = not self.enabled
+        status = "enabled" if self.enabled else "disabled"
+        print(f"[Voice] Voice assistant {status}")
+        if self.enabled:
+            print("  - Use /voice-input to speak your command")
+            print("  - Responses will be read aloud")
+        return self.enabled
+
+
+# Global voice assistant
+voice_assistant = VoiceAssistant()
+
+
 def prompt_and_act(prompt: str, use_api: bool = False) -> dict:
     """
     Main entry point for the agent system.
@@ -2577,6 +2785,18 @@ def prompt_and_act(prompt: str, use_api: bool = False) -> dict:
     if prompt == "/goals":
         goal_tracker.display(output_mode_manager.verbose)
         return {"response": "Goals displayed.", "action": None, "action_type": "goals", "result": None}
+
+    # Handle voice commands
+    if prompt == "/voice":
+        voice_assistant.toggle()
+        return {"response": "Voice assistant toggled.", "action": None, "action_type": "voice", "result": None}
+
+    if prompt == "/voice-input":
+        voice_input = voice_assistant.listen()
+        if voice_input:
+            print(f"\n[Processing voice input: {voice_input}]")
+            return prompt_and_act(voice_input, use_api=use_api)
+        return {"response": "No voice input detected.", "action": None, "action_type": "voice", "result": None}
 
     # Handle agentic mode - autonomous goal-oriented agent loop
     if prompt.startswith("/agentic"):
@@ -2698,6 +2918,7 @@ def prompt_and_act(prompt: str, use_api: bool = False) -> dict:
             # Track executed actions for context and deduplication
             executed_actions_summary = []
             executed_action_hashes = set()  # Prevent repeating same action
+            file_contents_read = {}  # Store contents of files that were read
 
             while iteration < max_iterations:
                 iteration += 1
@@ -2708,11 +2929,20 @@ def prompt_and_act(prompt: str, use_api: bool = False) -> dict:
                     if executed_actions_summary:
                         context_so_far = "Actions already completed:\n" + "\n".join(executed_actions_summary) + "\n\n"
 
+                    # Include file contents that were already read
+                    files_content_context = ""
+                    if file_contents_read:
+                        files_content_context = "\n".join([
+                            f"\n[CONTENT OF {fp}]:\n{content}\n[/CONTENT]"
+                            for fp, content in file_contents_read.items()
+                        ]) + "\n"
+
                     # Get LLM response for continuation
                     continuation_prompt = f"""
 Previous request: {prompt}
 
-{context_so_far}Based on the original request and what has been done, what is the NEXT action(s) needed?
+{context_so_far}{files_content_context}
+Based on the original request and what has been done, what is the NEXT action(s) needed?
 
 CRITICAL RULES:
 1. CHECK BEFORE CREATING: Before creating any file/folder, check if it already exists. If a React app folder exists (my-app, react-app, src/, etc.), DO NOT create another one.
@@ -2720,6 +2950,7 @@ CRITICAL RULES:
 3. DECLARE COMPLETE EARLY: If the main goal is achieved (e.g., a working React app exists), output [TASK_COMPLETE] immediately - don't keep adding more.
 4. AVOID REDUNDANT LISTING: Do NOT list the same directory twice. If you already listed a directory, use that knowledge.
 5. SINGLE FOLDER RULE: For "add react project", create ONLY ONE folder (preferably named "react-app" or "my-app"), not multiple.
+6. FILES ALREADY READ: If a file was already read (see [CONTENT OF ...] above), DO NOT re-read it. Use the content provided.
 
 RESPONSE FORMAT:
 - If task is COMPLETE: [TASK_COMPLETE] Brief summary [/TASK_COMPLETE]
@@ -2802,8 +3033,16 @@ RESPONSE FORMAT:
                                 executed_actions_summary.append(f"- Listed directory: {params.get('path', '')}")
                             elif tool_name == "read_file":
                                 executed_actions_summary.append(f"- Read file: {filepath}")
+                                # Store file content to include in continuation prompt
+                                file_contents_read[filepath] = tool_result.output
                             if output_mode_manager.verbose:
-                                print(f"[Success] {tool_result.output[:150] if tool_result.output else 'Done'}")
+                                # Handle Unicode characters that may not be encodable to console
+                                output_text = tool_result.output[:150] if tool_result.output else 'Done'
+                                try:
+                                    print(f"[Success] {output_text}")
+                                except UnicodeEncodeError:
+                                    # Fall back to ASCII-safe encoding for Windows console
+                                    print(f"[Success] {output_text.encode('ascii', errors='ignore').decode()}")
                         else:
                             if output_mode_manager.verbose:
                                 print(f"[Failed] {tool_result.error}")
@@ -2827,7 +3066,7 @@ RESPONSE FORMAT:
 
             # AUTO-CONTINUE: If user asked to edit but LLM only read the file,
             # automatically generate the edit based on the user's request
-            if action.get("type") == "tool" and action.get("tool") == "read_file":
+            if action and action.get("type") == "tool" and action.get("tool") == "read_file":
                 edit_intent = any(kw in prompt.lower() for kw in
                                     ['edit', 'update', 'modify', 'change', 'add', 'insert',
                                     'replace', 'fix', 'improve', 'refactor', 'include'])
@@ -2842,15 +3081,15 @@ RESPONSE FORMAT:
                         # Ask LLM to generate the edit based on user's request
                         print(f"\n[Auto-completing edit for {filepath}...]")
                         edit_prompt = f"""Based on the user's request: "{prompt}"
-                        Current file content:
-                        {current_content}
+                            Current file content:
+                            {current_content}
 
-                        Provide the COMPLETE new content for {filepath} that incorporates the user's request.
-                        Output ONLY the new content, no explanations.
-                        Format your response as:
-                        [TOOL edit_file]
-                        {{"filepath": "{filepath}", "new_content": "YOUR COMPLETE NEW CONTENT HERE"}}
-                        [/TOOL]"""
+                            Provide the COMPLETE new content for {filepath} that incorporates the user's request.
+                            Output ONLY the new content, no explanations.
+                            Format your response as:
+                            [TOOL edit_file]
+                            {{"filepath": "{filepath}", "new_content": "YOUR COMPLETE NEW CONTENT HERE"}}
+                            [/TOOL]"""
                         if use_api:
                             edit_response = run_ollama_chat([{"role": "user", "content": edit_prompt}], stream=False)
                         else:
@@ -3022,6 +3261,8 @@ if __name__ == "__main__":
         print("  /run-python   - Run Python code from last response in sandbox")
         print("  /run-js       - Run JavaScript code from last response in sandbox")
         print("  /agentic      - TRUE AGENTIC MODE: Loop until goal achieved")
+        print("  /voice        - Toggle voice assistant (TTS output)")
+        print("  /voice-input  - Speak your command (speech-to-text)")
         print("  /quit         - Exit (shows session summary)")
         print("=" * 60)
         print("FEATURES:")
@@ -3029,6 +3270,8 @@ if __name__ == "__main__":
         print("  - Continuation loop (keeps working until task done)")
         print("  - Claude-like permission prompts (Allow/Deny/Allow Always)")
         print("  - Goal/step tracking with visual progress")
+        print("  - Claude-like diff display (shows +/- for changes)")
+        print("  - Voice assistant (text-to-speech & speech-to-text)")
         print("=" * 60)
         print("MODES:")
         print("  Normal: One action per prompt (waits for your input)")
@@ -3102,6 +3345,18 @@ if __name__ == "__main__":
                     permission_manager.denied_always.clear()
                     print("\n[Permissions] All permissions reset.")
                     continue
+                elif prompt == "/voice":
+                    voice_assistant.toggle()
+                    continue
+                elif prompt == "/voice-input":
+                    voice_input = voice_assistant.listen()
+                    if voice_input:
+                        print(f"\n[Processing voice input: {voice_input}]")
+                        result = prompt_and_act(voice_input, use_api=use_api_for_repl)
+                        if voice_assistant.enabled and result.get("response"):
+                            voice_assistant.speak(result["response"])
+                        continue
+                    continue
                 elif prompt.startswith("/run-python") or prompt.startswith("/run-js"):
                     # Handled in prompt_and_act
                     pass
@@ -3134,7 +3389,8 @@ if __name__ == "__main__":
                     if isinstance(result_data, dict) and result_data.get("actions_executed"):
                         total = result_data["actions_executed"]
                         successful = result_data.get("successful", 0)
-                        print(f"\n[Actions Completed] {successful}/{total} successful")
+                        summary = f"{successful} of {total} actions successful"
+                        print(f"\n[Actions Completed] {summary}")
 
                         # Show details for each action
                         for i, action_result in enumerate(result_data.get("results", []), 1):
@@ -3146,6 +3402,11 @@ if __name__ == "__main__":
                                         print(f"  {i}. Created/Modified: {filepath}")
                                 elif action_result.get("error"):
                                     print(f"  {i}. Failed: {action_result.get('error')[:100]}")
+
+                        # Voice output for summary
+                        if voice_assistant.enabled:
+                            voice_assistant.speak(f"{successful} of {total} actions completed successfully")
+
                     elif result["action_type"] == "tool":
                         action = result.get("action", {})
                         tool_name = action.get("tool", "unknown")
