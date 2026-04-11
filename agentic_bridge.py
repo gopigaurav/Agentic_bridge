@@ -2107,61 +2107,81 @@ def get_system_prompt() -> str:
     return _cached_system_prompt
 
 def run_ollama_generate(prompt: str, stream: bool = True) -> str:
-    """Run Ollama generate API and return output. Streaming enabled by default."""
+    """Run Ollama generate API and return output. Handles recursive continuation for large edits."""
     full_prompt = get_system_prompt() + "\n\nUser: " + prompt + "\nAssistant:"
+    
+    # Initialize payload
     payload = {
         "model": OLLAMA_MODEL,
         "prompt": full_prompt,
-        "stream": True,  # Enable streaming - show output as it generates
+        "stream": True,
         "options": {
-            "num_predict": 4096,  # Reasonable limit for most responses (faster)
+            "num_predict": 8192, 
             "temperature": 0.7,
         }
     }
 
     output = ""
-    if HAS_REQUESTS:
-        try:
-            resp = requests.post(OLLAMA_API_URL, json=payload, timeout=120, stream=True)
-            resp.raise_for_status()
-            for line in resp.iter_lines():
-                if line:
-                    data = json.loads(line)
-                    chunk = data.get("response", "")
-                    if chunk:
-                        if stream:
-                            print(chunk, end="", flush=True)  # Show as it generates
-                        output += chunk
-        except requests.exceptions.RequestException as e:
-            print(f"\n[API Error] {e}")
-            # Fallback to non-streaming
-            payload["stream"] = False
-            resp = requests.post(OLLAMA_API_URL, json=payload, timeout=120)
-            data = resp.json()
-            output = data.get("response", "")
-            if stream and output:
-                print(output, end="", flush=True)
-    else:
-        req = urllib.request.Request(
-            OLLAMA_API_URL,
-            data=json.dumps(payload).encode(),
-            headers={"Content-Type": "application/json"}
-        )
-        with urllib.request.urlopen(req, timeout=120) as resp:
-            for line in resp:
-                if line:
-                    data = json.loads(line.decode())
-                    chunk = data.get("response", "")
-                    if chunk:
-                        if stream:
-                            print(chunk, end="", flush=True)
-                        output += chunk
+    done = False
+    data = {}
 
-    # Note: Removed auto-continuation for truncated responses
-    # This was causing double LLM calls. Truncation is rare with 4096 tokens.
+    while not done:
+        if HAS_REQUESTS:
+            try:
+                resp = requests.post(OLLAMA_API_URL, json=payload, timeout=120, stream=True)
+                resp.raise_for_status()
+
+                for line in resp.iter_lines():
+                    if line:
+                        data = json.loads(line)
+                        chunk = data.get("response", "")
+                        if chunk:
+                            if stream:
+                                print(chunk, end="", flush=True)
+                            output += chunk
+                
+                # Check for truncation inside the loop
+                if data.get("done") and data.get("done_reason") == "length":
+                    print("\n[System] Response truncated. Requesting continuation...")
+                    # Update prompt to include the output so far to trigger continuation
+                    payload["prompt"] = full_prompt + output
+                else:
+                    done = True
+
+            except requests.exceptions.RequestException as e:
+                print(f"\n[API Error] {e}")
+                # Fallback to non-streaming for errors
+                payload["stream"] = False
+                resp = requests.post(OLLAMA_API_URL, json=payload, timeout=120)
+                data = resp.json()
+                fallback_output = data.get("response", "")
+                if stream and fallback_output:
+                    print(fallback_output, end="", flush=True)
+                output += fallback_output
+                done = True # Exit on fallback to prevent loop complexity
+        else:
+            # Urllib fallback implementation
+            req = urllib.request.Request(
+                OLLAMA_API_URL,
+                data=json.dumps(payload).encode(),
+                headers={"Content-Type": "application/json"}
+            )
+            with urllib.request.urlopen(req, timeout=120) as resp:
+                for line in resp:
+                    if line:
+                        data = json.loads(line.decode())
+                        chunk = data.get("response", "")
+                        if chunk:
+                            if stream:
+                                print(chunk, end="", flush=True)
+                            output += chunk
+            
+            if data.get("done") and data.get("done_reason") == "length":
+                payload["prompt"] = full_prompt + output
+            else:
+                done = True
 
     return output
-
 
 def run_ollama_cli(prompt: str, stream: bool = True) -> str:
     """Run Ollama model via CLI - falls back to API for better reliability. Streaming enabled by default."""
@@ -2949,24 +2969,38 @@ def prompt_and_act(prompt: str, use_api: bool = False) -> dict:
                             for fp, content in file_contents_read.items()
                         ]) + "\n"
 
+                    # Detect what kind of task this is
+                    is_edit_task = any(kw in prompt.lower() for kw in ['edit', 'update', 'modify', 'change', 'add to', 'improve', 'reduce', 'refactor'])
+                    is_create_task = any(kw in prompt.lower() for kw in ['create', 'make', 'write', 'generate', 'build', 'setup'])
+
                     # Get LLM response for continuation
                     continuation_prompt = f"""
 Previous request: {prompt}
 
 {context_so_far}{files_content_context}
-Based on the original request and what has been done, what is the NEXT action(s) needed?
+Based on the original request and what has been done, determine if the task is COMPLETE or needs more work.
 
-CRITICAL RULES:
-1. CHECK BEFORE CREATING: Before creating any file/folder, check if it already exists. If a React app folder exists (my-app, react-app, src/, etc.), DO NOT create another one.
-2. DO NOT REPEAT: Never repeat an action already in the "completed" list above.
-3. DECLARE COMPLETE EARLY: If the main goal is achieved (e.g., a working React app exists), output [TASK_COMPLETE] immediately - don't keep adding more.
-4. AVOID REDUNDANT LISTING: Do NOT list the same directory twice. If you already listed a directory, use that knowledge.
-5. SINGLE FOLDER RULE: For "add react project", create ONLY ONE folder (preferably named "react-app" or "my-app"), not multiple.
-6. FILES ALREADY READ: If a file was already read (see [CONTENT OF ...] above), DO NOT re-read it. Use the content provided.
+IMPORTANT: Think step by step:
+1. What did the user originally ask for?
+2. What has been accomplished so far?
+3. Is the original request fully satisfied?
+   - If YES: Output [TASK_COMPLETE] with a summary
+   - If NO: What specific action is still needed?
+
+GUIDANCE:
+- For "edit/update/reduce/modify" requests: After ONE successful edit, usually the task is DONE unless the edit clearly failed
+- For "create" requests: May need multiple file creates, then DONE
+- If you just made an edit and the file now matches the request → COMPLETE
+- If you just made an edit but there's clearly more work → Continue with specific next action
+
+AVOID:
+- Making additional "improvements" that weren't requested
+- Editing the same file multiple times unless the first edit clearly failed
+- Assuming more work is needed when the request is satisfied
 
 RESPONSE FORMAT:
-- If task is COMPLETE: [TASK_COMPLETE] Brief summary [/TASK_COMPLETE]
-- If MORE actions needed: Output [TOOL] tags for each action
+- If COMPLETE: [TASK_COMPLETE] Brief summary of what was accomplished [/TASK_COMPLETE]
+- If MORE NEEDED: [TOOL] tags for specific next actions
 """
                     if output_mode_manager.verbose:
                         print(f"\n[Continuation {iteration}/{max_iterations}] Determining next actions...")
