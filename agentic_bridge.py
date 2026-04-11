@@ -2096,27 +2096,51 @@ def run_ollama_chat(messages: List[Dict], stream: bool = False) -> str:
         return output
 
 
+# Cache for system prompt to avoid rebuilding every time
+_cached_system_prompt = None
+
+def get_system_prompt() -> str:
+    """Get cached system prompt."""
+    global _cached_system_prompt
+    if _cached_system_prompt is None:
+        _cached_system_prompt = build_system_prompt()
+    return _cached_system_prompt
+
 def run_ollama_generate(prompt: str, stream: bool = True) -> str:
     """Run Ollama generate API and return output. Streaming enabled by default."""
-    full_prompt = build_system_prompt() + "\n\nUser: " + prompt + "\nAssistant:"
+    full_prompt = get_system_prompt() + "\n\nUser: " + prompt + "\nAssistant:"
     payload = {
         "model": OLLAMA_MODEL,
         "prompt": full_prompt,
-        "stream": False,  # Disable streaming for complete responses (avoid truncation)
+        "stream": True,  # Enable streaming - show output as it generates
         "options": {
-            "num_predict": 16384,  # Max tokens for long responses (increased for file edits)
+            "num_predict": 4096,  # Reasonable limit for most responses (faster)
             "temperature": 0.7,
         }
     }
 
     output = ""
     if HAS_REQUESTS:
-        resp = requests.post(OLLAMA_API_URL, json=payload, timeout=120)
-        resp.raise_for_status()
-        data = resp.json()
-        output = data.get("response", "")
-        if stream and output:
-            print(output, end="", flush=True)
+        try:
+            resp = requests.post(OLLAMA_API_URL, json=payload, timeout=120, stream=True)
+            resp.raise_for_status()
+            for line in resp.iter_lines():
+                if line:
+                    data = json.loads(line)
+                    chunk = data.get("response", "")
+                    if chunk:
+                        if stream:
+                            print(chunk, end="", flush=True)  # Show as it generates
+                        output += chunk
+        except requests.exceptions.RequestException as e:
+            print(f"\n[API Error] {e}")
+            # Fallback to non-streaming
+            payload["stream"] = False
+            resp = requests.post(OLLAMA_API_URL, json=payload, timeout=120)
+            data = resp.json()
+            output = data.get("response", "")
+            if stream and output:
+                print(output, end="", flush=True)
     else:
         req = urllib.request.Request(
             OLLAMA_API_URL,
@@ -2124,36 +2148,24 @@ def run_ollama_generate(prompt: str, stream: bool = True) -> str:
             headers={"Content-Type": "application/json"}
         )
         with urllib.request.urlopen(req, timeout=120) as resp:
-            data = json.loads(resp.read().decode())
-            output = data.get("response", "")
-            if stream and output:
-                print(output, end="", flush=True)
+            for line in resp:
+                if line:
+                    data = json.loads(line.decode())
+                    chunk = data.get("response", "")
+                    if chunk:
+                        if stream:
+                            print(chunk, end="", flush=True)
+                        output += chunk
 
-    # Check if response seems truncated (incomplete JSON inside [TOOL] tags, unclosed tags)
-    if output:
-        # Check for unclosed [TOOL] tags
-        open_tags = len(re.findall(r'\[TOOL\s+\w+\]', output)) - len(re.findall(r'\[/TOOL\]', output))
-        # Check for incomplete JSON inside [TOOL] tags (JSON that doesn't end with })
-        tool_matches = re.findall(r'\[TOOL\s+\w+\](.*?)(?:\[/TOOL\]|$)', output, re.DOTALL)
-        incomplete_json = False
-        for tool_content in tool_matches:
-            tool_content = tool_content.strip()
-            if tool_content and not tool_content.endswith('}'):
-                incomplete_json = True
-                break
-
-        if open_tags > 0 or incomplete_json:
-            print("\n[Warning] Response appears truncated, requesting continuation...")
-            continuation = run_ollama_generate("Continue from where you left off. Complete the JSON/tool tags.", stream=False)
-            output += continuation
+    # Note: Removed auto-continuation for truncated responses
+    # This was causing double LLM calls. Truncation is rare with 4096 tokens.
 
     return output
 
 
-def run_ollama_cli(prompt: str, stream: bool = False) -> str:
-    """Run Ollama model via CLI - falls back to API for better reliability."""
-    # CLI mode has issues with streaming and token limits
-    # Fall back to API which handles responses more reliably
+def run_ollama_cli(prompt: str, stream: bool = True) -> str:
+    """Run Ollama model via CLI - falls back to API for better reliability. Streaming enabled by default."""
+    # Use API with streaming for real-time output
     try:
         return run_ollama_generate(prompt, stream=stream)
     except Exception as e:
