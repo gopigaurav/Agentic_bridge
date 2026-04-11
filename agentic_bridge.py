@@ -1222,13 +1222,13 @@ def find_similar_file(filepath: str, max_distance: int = 3) -> str:
 
         return previous_row[-1]
 
-        # Find files with similar names by comparing each file in directory
-        for filename in os.listdir(dirname):
-            distance = levenshtein_distance(basename, filename)
-            if distance <= max_distance:
-                return os.path.join(dirname, filename)
+    # Find files with similar names by comparing each file in directory
+    for filename in os.listdir(dirname):
+        distance = levenshtein_distance(basename, filename)
+        if distance <= max_distance:
+            return os.path.join(dirname, filename)
 
-        return filepath  # No similar file found
+    return filepath  # No similar file found
 
 
 class ReadFileTool(Tool):
