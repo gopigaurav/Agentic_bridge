@@ -2142,9 +2142,15 @@ def run_ollama_generate(prompt: str, stream: bool = True) -> str:
                 
                 # Check for truncation inside the loop
                 if data.get("done") and data.get("done_reason") == "length":
-                    print("\n[System] Response truncated. Requesting continuation...")
-                    # Update prompt to include the output so far to trigger continuation
+                    print("\n[System] Response truncated (length). Requesting continuation...")
                     payload["prompt"] = full_prompt + output
+                elif data.get("done"):
+                    # Model finished but check if output is incomplete (missing [/TOOL] tag)
+                    if "[TOOL" in output and "[/TOOL]" not in output:
+                        print("\n[System] Response incomplete (missing [/TOOL]). Requesting continuation...")
+                        payload["prompt"] = full_prompt + output + "\n\nContinue and close all [TOOL] tags. Finish the JSON properly."
+                    else:
+                        done = True
                 else:
                     done = True
 
@@ -2973,30 +2979,40 @@ def prompt_and_act(prompt: str, use_api: bool = False) -> dict:
                     is_edit_task = any(kw in prompt.lower() for kw in ['edit', 'update', 'modify', 'change', 'add to', 'improve', 'reduce', 'refactor'])
                     is_create_task = any(kw in prompt.lower() for kw in ['create', 'make', 'write', 'generate', 'build', 'setup'])
 
+                    # Check if an edit was already performed
+                    edit_was_performed = any('edit' in s.lower() or 'modified' in s.lower()
+                                             for s in executed_actions_summary)
+
                     # Get LLM response for continuation
                     continuation_prompt = f"""
 Previous request: {prompt}
 
 {context_so_far}{files_content_context}
+"""
+
+                    # If an edit was already done, be VERY explicit about stopping
+                    if edit_was_performed:
+                        continuation_prompt += """
+⚠️  AN EDIT WAS JUST PERFORMED. Before proposing another edit, you MUST answer:
+
+1. Did the previous edit FAIL or have errors? (If NO → task is COMPLETE)
+2. Is there SPECIFIC content the user requested that is STILL missing? (Be specific)
+3. Or are you just trying to "improve" or "shorten" further? (If YES → STOP, task is COMPLETE)
+
+RULE: After ONE successful edit, the task is COMPLETE. Do NOT edit again unless:
+- The edit clearly failed (syntax errors, broken content)
+- The user explicitly asked for multiple rounds of edits
+
+If the task is complete, output: [TASK_COMPLETE] Summary here [/TASK_COMPLETE]
+"""
+                    else:
+                        continuation_prompt += """
 Based on the original request and what has been done, determine if the task is COMPLETE or needs more work.
 
-IMPORTANT: Think step by step:
-1. What did the user originally ask for?
-2. What has been accomplished so far?
-3. Is the original request fully satisfied?
-   - If YES: Output [TASK_COMPLETE] with a summary
-   - If NO: What specific action is still needed?
-
 GUIDANCE:
-- For "edit/update/reduce/modify" requests: After ONE successful edit, usually the task is DONE unless the edit clearly failed
+- For "edit/update/reduce/modify" requests: After ONE successful edit, the task is DONE
 - For "create" requests: May need multiple file creates, then DONE
 - If you just made an edit and the file now matches the request → COMPLETE
-- If you just made an edit but there's clearly more work → Continue with specific next action
-
-AVOID:
-- Making additional "improvements" that weren't requested
-- Editing the same file multiple times unless the first edit clearly failed
-- Assuming more work is needed when the request is satisfied
 
 RESPONSE FORMAT:
 - If COMPLETE: [TASK_COMPLETE] Brief summary of what was accomplished [/TASK_COMPLETE]
@@ -3038,10 +3054,15 @@ RESPONSE FORMAT:
                     # Check permission for file operations (Claude-like)
                     if action.get("tool") in ["write_file", "edit_file", "delete_file"]:
                         has_perm, reason = permission_manager.check_permission(action)
+                        filepath = action.get("parameters", {}).get("filepath", "unknown")
+                        if output_mode_manager.verbose:
+                            print(f"\n[Permission Check] {action.get('tool')} on {filepath}")
+                            print(f"  has_perm={has_perm}, reason={reason}")
+                            print(f"  allowed_always patterns: {permission_manager.allowed_always}")
                         if not has_perm:
                             # Ask user for permission
                             if not permission_manager.ask_permission(action):
-                                print(f"[Permission Denied] Skipping {action.get('parameters', {}).get('filepath', 'unknown')}")
+                                print(f"[Permission Denied] Skipping {filepath}")
                                 batch_results.append({"skipped": True, "reason": "Permission denied"})
                                 continue
 
@@ -3075,6 +3096,9 @@ RESPONSE FORMAT:
                                 executed_actions_summary.append(f"- Created file: {filepath}")
                             elif tool_name == "edit_file":
                                 executed_actions_summary.append(f"- Modified file: {filepath}")
+                                # After a successful edit, exit loop to let user review (Claude-like)
+                                print("\n[Edit applied. Returning control to user for review.]")
+                                iteration = max_iterations  # Force exit of continuation loop
                             elif tool_name == "list_directory":
                                 executed_actions_summary.append(f"- Listed directory: {params.get('path', '')}")
                             elif tool_name == "read_file":
