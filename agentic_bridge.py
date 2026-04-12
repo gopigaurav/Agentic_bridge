@@ -987,6 +987,7 @@ class AgenticLoop:
 
         # Parse tool action
         action = parse_action_from_response(response)
+        print(action)
         if action:
             return action
 
@@ -2993,31 +2994,31 @@ Previous request: {prompt}
                     # If an edit was already done, be VERY explicit about stopping
                     if edit_was_performed:
                         continuation_prompt += """
-⚠️  AN EDIT WAS JUST PERFORMED. Before proposing another edit, you MUST answer:
+                        ⚠️  AN EDIT WAS JUST PERFORMED. Before proposing another edit, you MUST answer:
 
-1. Did the previous edit FAIL or have errors? (If NO → task is COMPLETE)
-2. Is there SPECIFIC content the user requested that is STILL missing? (Be specific)
-3. Or are you just trying to "improve" or "shorten" further? (If YES → STOP, task is COMPLETE)
+                        1. Did the previous edit FAIL or have errors? (If NO → task is COMPLETE)
+                        2. Is there SPECIFIC content the user requested that is STILL missing? (Be specific)
+                        3. Or are you just trying to "improve" or "shorten" further? (If YES → STOP, task is COMPLETE)
 
-RULE: After ONE successful edit, the task is COMPLETE. Do NOT edit again unless:
-- The edit clearly failed (syntax errors, broken content)
-- The user explicitly asked for multiple rounds of edits
+                        RULE: After ONE successful edit, the task is COMPLETE. Do NOT edit again unless:
+                        - The edit clearly failed (syntax errors, broken content)
+                        - The user explicitly asked for multiple rounds of edits
 
-If the task is complete, output: [TASK_COMPLETE] Summary here [/TASK_COMPLETE]
-"""
+                        If the task is complete, output: [TASK_COMPLETE] Summary here [/TASK_COMPLETE]
+                        """
                     else:
                         continuation_prompt += """
-Based on the original request and what has been done, determine if the task is COMPLETE or needs more work.
+                        Based on the original request and what has been done, determine if the task is COMPLETE or needs more work.
 
-GUIDANCE:
-- For "edit/update/reduce/modify" requests: After ONE successful edit, the task is DONE
-- For "create" requests: May need multiple file creates, then DONE
-- If you just made an edit and the file now matches the request → COMPLETE
+                        GUIDANCE:
+                        - For "edit/update/reduce/modify" requests: After ONE successful edit, the task is DONE
+                        - For "create" requests: May need multiple file creates, then DONE
+                        - If you just made an edit and the file now matches the request → COMPLETE
 
-RESPONSE FORMAT:
-- If COMPLETE: [TASK_COMPLETE] Brief summary of what was accomplished [/TASK_COMPLETE]
-- If MORE NEEDED: [TOOL] tags for specific next actions
-"""
+                        RESPONSE FORMAT:
+                        - If COMPLETE: [TASK_COMPLETE] Brief summary of what was accomplished [/TASK_COMPLETE]
+                        - If MORE NEEDED: [TOOL] tags for specific next actions
+                        """
                     if output_mode_manager.verbose:
                         print(f"\n[Continuation {iteration}/{max_iterations}] Determining next actions...")
 
