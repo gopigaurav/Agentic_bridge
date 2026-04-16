@@ -82,6 +82,14 @@ import shutil
 from difflib import unified_diff
 from pathlib import Path
 
+# Import thinking display from separate module
+try:
+    from thinking_display import thinking_display, ThinkingDisplay
+    THINKING_DISPLAY_AVAILABLE = True
+except ImportError:
+    THINKING_DISPLAY_AVAILABLE = False
+    thinking_display = None
+
 # Try to import requests, fall back to urllib if not available
 try:
     import requests
@@ -1766,8 +1774,12 @@ def parse_plan_from_response(llm_response: str) -> Optional[Plan]:
         for step in plan_data.get("steps", []):
             plan.add_step(step["tool"], **step.get("parameters", {}))
         return plan
-    except json.JSONDecodeError:
-        pass
+    except json.JSONDecodeError as e:
+        # JSON parsing failed - likely due to unescaped newlines in content
+        # Instead of trying to recover the plan, return None so individual tool parsing kicks in
+        print(f"[Info] Plan JSON had issues: {e}")
+        print("[Info] Will try to extract individual [TOOL] calls from the response instead.")
+        return None
 
     # Fallback: parse structured text format
     lines = plan_text.strip().split("\n")
@@ -1822,23 +1834,45 @@ def parse_all_actions_from_response(response: str) -> List[Dict[str, Any]]:
                 continue
             actions.append({"type": "tool", "tool": tool_name, "parameters": params})
         except json.JSONDecodeError as e:
-            # Check if JSON is truncated (incomplete)
-            if params_text.endswith('"') or params_text.endswith('}'):
-                # Try fallback: parse key=value pairs
-                params = {}
-                for line in params_text.split("\n"):
-                    if "=" in line:
-                        key, value = line.split("=", 1)
-                        params[key.strip()] = value.strip()
-                if params:
+            # JSON parsing failed - likely due to unescaped newlines in content
+            # Try to extract filepath and reconstruct the action
+            filepath_match = re.search(r'"filepath":\s*"([^"]+)"', params_text)
+
+            if filepath_match:
+                # Extract content - everything after "content": to the end
+                content_start = params_text.find('"content":')
+                if content_start > 0:
+                    # Get content value - handle multi-line by taking everything after "content":
+                    content_text = params_text[content_start + 11:].strip()
+                    # Remove leading quote if present
+                    if content_text.startswith('"'):
+                        content_text = content_text[1:]
+                    # Remove trailing quote/brace if present
+                    if content_text.endswith('"}'):
+                        content_text = content_text[:-2]
+                    elif content_text.endswith('"'):
+                        content_text = content_text[:-1]
+
+                    params = {"filepath": filepath_match.group(1), "content": content_text}
                     actions.append({"type": "tool", "tool": tool_name, "parameters": params})
+                    print(f"[Info] Recovered write_file action for: {params['filepath']}")
+                else:
+                    print(f"[Warning] write_file missing content field")
             else:
-                print(f"[Warning] Skipping malformed {tool_name} action - incomplete JSON: {params_text[:50]}...")
+                print(f"[Warning] Skipping malformed {tool_name} action - cannot parse JSON: {params_text[:80]}...")
 
     # Find all [RUN]...[/RUN] tags
     run_pattern = r"\[RUN\](.*?)\[/RUN\]"
     for match in re.finditer(run_pattern, response, re.DOTALL):
-        actions.append({"type": "command", "value": match.group(1).strip()})
+        command_text = match.group(1).strip()
+        # Check if it's JSON formatted {"command": "..."}
+        try:
+            cmd_json = json.loads(command_text)
+            if isinstance(cmd_json, dict) and "command" in cmd_json:
+                command_text = cmd_json["command"]
+        except json.JSONDecodeError:
+            pass  # Not JSON, use as-is
+        actions.append({"type": "command", "value": command_text})
 
     # Find all [FILE filename]...[/FILE] tags
     file_pattern = r"\[FILE ([^\]]+)\](.*?)\[/FILE\]"
@@ -1846,6 +1880,21 @@ def parse_all_actions_from_response(response: str) -> List[Dict[str, Any]]:
         filename = match.group(1).strip()
         content = match.group(2).lstrip('\n')
         actions.append({"type": "tool", "tool": "write_file", "parameters": {"filepath": filename, "content": content}})
+
+    # Fallback: Find CREATE_FILE pattern (LLM sometimes uses this format)
+    # Pattern: [TOOL]\nCREATE_FILE\nPATH: filepath\n[/TOOL]
+    create_file_pattern = r"\[TOOL\]\s*CREATE_FILE\s*PATH:\s*([^\n]+)\s*\[/TOOL\]"
+    for match in re.finditer(create_file_pattern, response, re.DOTALL | re.IGNORECASE):
+        filepath = match.group(1).strip()
+        # Create empty file or with placeholder content
+        actions.append({"type": "tool", "tool": "write_file", "parameters": {"filepath": filepath, "content": "# Generated file\n# TODO: Add content"}})
+
+    # Fallback: Find [TOOL write_file] with content after PATH
+    write_file_pattern = r"\[TOOL\]\s*CREATE_FILE\s*PATH:\s*([^\n]+)\s*CONTENT:\s*(.*?)\s*\[/TOOL\]"
+    for match in re.finditer(write_file_pattern, response, re.DOTALL | re.IGNORECASE):
+        filepath = match.group(1).strip()
+        content = match.group(2).strip()
+        actions.append({"type": "tool", "tool": "write_file", "parameters": {"filepath": filepath, "content": content}})
 
     # If no structured actions found, try fallback patterns
     if not actions:
@@ -1975,10 +2024,12 @@ You have access to the following tools:
 
 CRITICAL RULES:
 1. You are an ACTION-TAKING agent. Do NOT ask questions or seek clarification.
-2. Before EDITING any file, FIRST read it using [TOOL read_file] to understand current content
-3. For FILE EDITING, use [TOOL edit_file] with the COMPLETE new content (not just the addition)
-4. For FILE CREATION, use [TOOL write_file] with full content
-5. Only use [RUN] for actual shell commands (ls, git, pip, etc.) - NEVER for file editing
+2. For creating multiple files: Use individual [TOOL write_file] calls, NOT [PLAN] blocks
+3. Before EDITING any file, FIRST read it using [TOOL read_file] to understand current content
+4. For FILE EDITING, use [TOOL edit_file] with the COMPLETE new content (not just the addition)
+5. For FILE CREATION, use [TOOL write_file] with full content
+6. Only use [RUN] for actual shell commands (ls, git, pip, etc.) - NEVER for file editing
+7. IMPORTANT: When creating files, escape newlines in content as \n (NOT actual line breaks)
 
 WORKFLOW FOR EDITING FILES:
 Step 1: Read the file first: [TOOL read_file]{{"filepath": "example.js"}}[/TOOL]
@@ -1999,8 +2050,16 @@ For file creation:
 {{"filepath": "example.js", "content": "full file content here"}}
 [/TOOL]
 
-For simple commands:
-[RUN]ls -la[/RUN]
+For simple commands (just the command, no JSON):
+[RUN]mkdir myfolder[/RUN]
+[RUN]git status[/RUN]
+[RUN]pip install requests[/RUN]
+
+NOTE: This is a Windows system. Use Windows commands:
+- Use `mkdir folder` NOT `mkdir -p folder`
+- Use `dir` NOT `ls`
+- Use `type file.txt` NOT `cat file.txt`
+- Use `del file.txt` NOT `rm file.txt`
 
 For multi-step tasks:
 [PLAN]
@@ -2013,12 +2072,52 @@ For multi-step tasks:
 }}
 [/PLAN]
 
+THINKING FORMAT - ALWAYS start with thinking, then use tools:
+
+CORRECT FORMAT:
+[THOUGHTS]
+- Analyze the request
+- Plan the steps
+SUMMARY: One-line summary
+[/THOUGHTS]
+
+[TOOL tool_name]
+{{"param": "value"}}
+[/TOOL]
+
+IMPORTANT: Close [THOUGHTS] with [/THOUGHTS] BEFORE any [TOOL] tags.
+NEVER mix them like [/TOOL something] inside thinking.
+
+CORRECT TOOL FORMAT EXAMPLES:
+
+To create a file:
+[TOOL write_file]
+{{"filepath": "mcp_integration/client.py", "content": "# Code here"}}
+[/TOOL]
+
+To read a file:
+[TOOL read_file]
+{{"filepath": "config.json"}}
+[/TOOL]
+
+To run a command:
+[RUN]mkdir newfolder[/RUN]
+
+WRONG FORMAT (DO NOT USE):
+[TOOL]
+CREATE_FILE
+PATH: filename
+[/TOOL]
+
+ALWAYS use [TOOL tool_name] with JSON parameters on the next line.
+
 IMPORTANT RULES:
 1. NEVER ask questions - just TAKE ACTION
-2. ALWAYS copy filenames EXACTLY as given - never change, abbreviate, or typo them
-3. If the user says "this file" or "the file", use the filename from context
-4. When editing, ALWAYS read the file first, then provide COMPLETE new content (not just additions)
-5. Be concise in explanations - focus on executing actions
+2. ALWAYS use EXACT filenames/paths - NEVER abbreviate (e.g., "mcp" is WRONG, use "mcp_integration")
+3. After creating a folder, use the EXACT same name in subsequent actions
+4. If the user says "this file" or "the file", use the filename from context
+5. When editing, ALWAYS read the file first, then provide COMPLETE new content (not just additions)
+6. Be concise in explanations - focus on executing actions
 
 Example interaction:
 User: "edit response.js to add array writing code"
@@ -2038,18 +2137,22 @@ def run_ollama_chat(messages: List[Dict], stream: bool = False) -> str:
     """
     Call Ollama's chat API endpoint.
     Uses the chat interface which is conversation-aware (good for multi-turn).
-    
+
     Args:
         messages: List of message dicts with "role" and "content" keys
         stream: If True, stream response; if False, wait for complete response
-        
+
     Returns:
         The LLM's text response
     """
+    # Prepend system prompt to messages
+    system_message = {"role": "system", "content": get_system_prompt()}
+    full_messages = [system_message] + messages
+
     # Prepare the API request payload
     payload = {
         "model": OLLAMA_MODEL,  # Which model to use
-        "messages": messages,  # Conversation history
+        "messages": full_messages,  # Conversation history with system prompt
         "stream": stream,  # Streaming response?
         "options": {
             "num_predict": 4096,  # Max tokens to generate (longer responses)
@@ -2064,12 +2167,25 @@ def run_ollama_chat(messages: List[Dict], stream: bool = False) -> str:
         output = ""
         if stream:
             # Stream response line by line
+            print("[LLM Streaming Response]")
+            print("-" * 40)
             for line in resp.iter_lines():
                 if line:
                     data = json.loads(line)
                     chunk = data.get("message", {}).get("content", "")
-                    print(chunk, end="", flush=True)  # Print as it arrives
+                    try:
+                        print(chunk, end="", flush=True)  # Print as it arrives
+                    except UnicodeEncodeError:
+                        # Windows console can't handle some Unicode characters
+                        print(chunk.encode('cp1252', errors='replace').decode('cp1252'), end="", flush=True)
                     output += chunk
+            print("\n" + "-" * 40)
+
+            # Parse and display thinking/summary from the response
+            if THINKING_DISPLAY_AVAILABLE:
+                thinking_blocks = thinking_display.parse_thinking_from_response(output)
+                if thinking_blocks:
+                    thinking_display.display_thinking(thinking_blocks, output)
         else:
             # Wait for complete response
             for line in resp.iter_lines():
@@ -2086,14 +2202,27 @@ def run_ollama_chat(messages: List[Dict], stream: bool = False) -> str:
             headers={"Content-Type": "application/json"}
         )
         output = ""
+        if stream:
+            print("[LLM Streaming Response]")
+            print("-" * 40)
         with urllib.request.urlopen(req) as resp:
             for line in resp:
                 if line:
                     data = json.loads(line.decode())
                     chunk = data.get("message", {}).get("content", "")
                     if stream:
-                        print(chunk, end="", flush=True)
+                        try:
+                            print(chunk, end="", flush=True)
+                        except UnicodeEncodeError:
+                            print(chunk.encode('cp1252', errors='replace').decode('cp1252'), end="", flush=True)
                     output += chunk
+        if stream:
+            print("\n" + "-" * 40)
+            # Parse and display thinking/summary from the response
+            if THINKING_DISPLAY_AVAILABLE:
+                thinking_blocks = thinking_display.parse_thinking_from_response(output)
+                if thinking_blocks:
+                    thinking_display.display_thinking(thinking_blocks, output)
         return output
 
 
@@ -2221,17 +2350,25 @@ def detect_intent_and_prepare_prompt(user_prompt: str, vscode_current_file: str 
     """
     Detects if the user wants to understand/explain a file and prepares the LLM prompt and filename.
     Returns (llm_prompt, filename or None).
+
+    Only triggers for PURE explanation requests, NOT for requests about modifying/adding to files.
     """
-    # Patterns for intent detection
+    # Exclude patterns that indicate modification/addition intent (not pure explanation)
+    exclusion_patterns = [
+        r"add", r"integrate", r"implement", r"modify", r"change", r"update",
+        r"how to", r"suggest", r"ways to", r"can you", r"could you"
+    ]
+
+    # If any exclusion pattern matches, don't trigger explain mode
+    for excl_pat in exclusion_patterns:
+        if re.search(excl_pat, user_prompt, re.IGNORECASE):
+            return (None, None)
+
+    # Patterns for pure explanation intent
     understand_patterns = [
-        r"understand (this|the|current)? ?file",
-        r"explain (this|the|current)? ?file",
-        r"summarize (this|the|current)? ?file",
-        r"what does (this|the|current)? ?file do",
-        r"explain ([\w\-.]+)",
-        r"understand ([\w\-.]+)",
-        r"summarize ([\w\-.]+)",
-        r"what does ([\w\-.]+) do"
+        r"^(understand|explain|summarize)\s+(this|the|current)\s+file",
+        r"^(what\s+does\s+this\s+file\s+do)",
+        r"^(explain|understand|summarize)\s+([\w\-.]+\.[\w]+)$",
     ]
 
     for pat in understand_patterns:
@@ -2389,11 +2526,16 @@ def execute_plan(plan: Plan) -> List[Dict]:
             "parameters": step["parameters"]
         }
 
-        # Check for confirmation
-        if require_confirmation(action) and not confirm_action(action):
-            plan.mark_step_failed("User cancelled")
-            results.append({"step": step, "status": "cancelled", "error": "User cancelled"})
-            break
+        # Check for confirmation (skip in non-interactive mode)
+        if require_confirmation(action):
+            try:
+                if not confirm_action(action):
+                    plan.mark_step_failed("User cancelled")
+                    results.append({"step": step, "status": "cancelled", "error": "User cancelled"})
+                    break
+            except (EOFError, KeyboardInterrupt):
+                # Non-interactive mode - proceed without confirmation
+                pass
 
         result = execute_action(action)
         plan.mark_step_complete(result.to_dict())
@@ -2493,15 +2635,27 @@ class DiffDisplay:
                 continue  # Skip header lines
             elif line.startswith('@@'):
                 # Show hunk header
-                print(f"\n{line}")
+                try:
+                    print(f"\n{line}")
+                except UnicodeEncodeError:
+                    print(f"\n{line.encode('cp1252', errors='replace').decode('cp1252')}")
             elif line.startswith('-'):
-                print(f"\033[31m{line}\033[0m")  # Red for removed
+                try:
+                    print(f"\033[31m{line}\033[0m")  # Red for removed
+                except UnicodeEncodeError:
+                    print(f"\033[31m{line.encode('cp1252', errors='replace').decode('cp1252')}\033[0m")
                 removed_count += 1
             elif line.startswith('+'):
-                print(f"\033[32m{line}\033[0m")  # Green for added
+                try:
+                    print(f"\033[32m{line}\033[0m")  # Green for added
+                except UnicodeEncodeError:
+                    print(f"\033[32m{line.encode('cp1252', errors='replace').decode('cp1252')}\033[0m")
                 added_count += 1
             else:
-                print(f" {line}")  # Context lines
+                try:
+                    print(f" {line}")  # Context lines
+                except UnicodeEncodeError:
+                    print(f" {line.encode('cp1252', errors='replace').decode('cp1252')}")
 
         print(f"\nSummary: +{added_count} lines, -{removed_count} lines")
         print(f"{'='*60}\n")
@@ -2942,7 +3096,51 @@ def prompt_and_act(prompt: str, use_api: bool = False) -> dict:
             }
             action_type = "plan"
             action = plan.to_dict()
-        elif actions:
+        elif not actions and not (plan and plan.steps):
+            # No actions parsed and no valid plan - check if LLM output a malformed plan
+            if "[PLAN]" in response:
+                print("[Warning] LLM output a [PLAN] but JSON was malformed.")
+                print("[Info] Attempting to extract file creation steps from the plan...")
+
+                # Extract the plan content
+                plan_match = re.search(r"\[PLAN\](.*?)\[/PLAN\]", response, re.DOTALL)
+                if plan_match:
+                    plan_text = plan_match.group(1)
+
+                    # Find all {"tool": "write_file", ...} patterns
+                    write_file_pattern = r'\{"tool":\s*"write_file",\s*"parameters":\s*\{([^}]+(?:\{[^}]*\}[^}]*)?)\}\}'
+
+                    # Simpler approach: find filepath and extract content after it
+                    filepath_matches = list(re.finditer(r'"filepath":\s*"([^"]+)"', plan_text))
+
+                    for fp_match in filepath_matches:
+                        filepath = fp_match.group(1)
+                        # Find the content for this file - everything after "content": "
+                        content_start_pos = plan_text.find('"content":', fp_match.start())
+                        if content_start_pos > 0:
+                            # Find the closing of this step (next {"tool" or end)
+                            next_step = plan_text.find('{"tool"', content_start_pos)
+                            if next_step == -1:
+                                next_step = plan_text.find(']}', content_start_pos)
+                            if next_step == -1:
+                                next_step = len(plan_text)
+
+                            content_text = plan_text[content_start_pos + 11:next_step].strip()
+                            # Clean up: remove trailing quotes, braces, commas
+                            content_text = content_text.rstrip('"}],').strip('"')
+
+                            actions.append({
+                                "type": "tool",
+                                "tool": "write_file",
+                                "parameters": {"filepath": filepath, "content": content_text}
+                            })
+                            print(f"[Info] Extracted: write_file -> {filepath}")
+
+                if not actions:
+                    print("[Warning] Could not extract any valid actions from the plan.")
+            elif not actions:
+                print("[No actions to execute. Task may be complete or LLM didn't output valid tool calls.]")
+        if actions:
             # CONTINUATION LOOP: Keep executing until task is complete
             # This fixes the issue where only 1 action runs and stops
             all_results = []
@@ -3011,13 +3209,18 @@ Previous request: {prompt}
                         Based on the original request and what has been done, determine if the task is COMPLETE or needs more work.
 
                         GUIDANCE:
-                        - For "edit/update/reduce/modify" requests: After ONE successful edit, the task is DONE
-                        - For "create" requests: May need multiple file creates, then DONE
-                        - If you just made an edit and the file now matches the request → COMPLETE
+                        - For "create" requests: Create ALL requested files, then mark COMPLETE
+                        - If files still need to be created: Output [TOOL write_file] calls NOW
+                        - Do NOT just describe what you will do - OUTPUT THE ACTUAL [TOOL] CALLS
+
+                        CRITICAL: If you mentioned creating files, you MUST output:
+                        [TOOL write_file]
+                        {{"filepath": "path/to/file.py", "content": "file content here"}}
+                        [/TOOL]
 
                         RESPONSE FORMAT:
                         - If COMPLETE: [TASK_COMPLETE] Brief summary of what was accomplished [/TASK_COMPLETE]
-                        - If MORE NEEDED: [TOOL] tags for specific next actions
+                        - If MORE NEEDED: [TOOL] tags for specific next actions (NOT descriptions)
                         """
                     if output_mode_manager.verbose:
                         print(f"\n[Continuation {iteration}/{max_iterations}] Determining next actions...")
