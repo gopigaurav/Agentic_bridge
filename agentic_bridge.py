@@ -1525,6 +1525,7 @@ class SearchCodeTool(Tool):
     def execute(self, pattern: str, file_pattern: str = None,
                 path: str = None, **kwargs) -> ToolResult:
         try:
+            import fnmatch
             search_path = path or os.getcwd()
             results = []
 
@@ -1533,13 +1534,15 @@ class SearchCodeTool(Tool):
                 dirs[:] = [d for d in dirs if not d.startswith('.') and d not in ['node_modules', 'venv', '__pycache__', 'dist', 'build']]
 
                 for filename in files:
-                    if file_pattern and not re.search(file_pattern, filename):
+                    # Use fnmatch for glob patterns (*.py) instead of regex
+                    if file_pattern and not fnmatch.fnmatch(filename, file_pattern):
                         continue
 
                     filepath = os.path.join(root, filename)
                     try:
                         with open(filepath, "r", encoding="utf-8", errors="ignore") as f:
                             content = f.read()
+                            # Use simple string matching for the search pattern
                             if pattern in content:
                                 # Find line numbers
                                 for i, line in enumerate(content.splitlines(), 1):
@@ -2162,8 +2165,25 @@ def run_ollama_chat(messages: List[Dict], stream: bool = False) -> str:
 
     if HAS_REQUESTS:
         # Use requests library if available (cleaner API)
-        resp = requests.post(CHAT_API_URL, json=payload, stream=stream)
-        resp.raise_for_status()
+        try:
+            resp = requests.post(CHAT_API_URL, json=payload, stream=stream, timeout=120)
+            resp.raise_for_status()
+        except requests.exceptions.HTTPError as e:
+            if e.response.status_code == 500:
+                print(f"\n[Error] Ollama server returned HTTP 500 - Internal Server Error.")
+                print(f"[Hint] The model may have crashed or isn't loaded. Try:")
+                print(f"       ollama pull {OLLAMA_MODEL}")
+                print(f"       ollama serve")
+            else:
+                print(f"\n[Error] Ollama API error: {e}")
+            # Fallback to CLI mode
+            return run_ollama_cli(messages[0].get("content", "") if messages else "", stream)
+        except requests.exceptions.RequestException as e:
+            print(f"\n[Error] Failed to connect to Ollama: {e}")
+            print(f"[Hint] Make sure Ollama is running: ollama serve")
+            # Fallback to CLI mode
+            return run_ollama_cli(messages[0].get("content", "") if messages else "", stream)
+
         output = ""
         if stream:
             # Stream response line by line
@@ -3182,11 +3202,23 @@ def prompt_and_act(prompt: str, use_api: bool = False) -> dict:
                     edit_was_performed = any('edit' in s.lower() or 'modified' in s.lower()
                                              for s in executed_actions_summary)
 
+                    # Get list of available files to help LLM choose correct filenames
+                    available_files_hint = ""
+                    try:
+                        files_in_cwd = [f for f in os.listdir('.') if os.path.isfile(f)]
+                        if files_in_cwd:
+                            available_files_hint = f"\nFiles in current directory: {', '.join(files_in_cwd)}"
+                    except:
+                        pass
+
                     # Get LLM response for continuation
                     continuation_prompt = f"""
 Previous request: {prompt}
 
 {context_so_far}{files_content_context}
+{available_files_hint}
+
+IMPORTANT: Before reading any file, check if it exists in the list above. If unsure, use list_directory first.
 """
 
                     # If an edit was already done, be VERY explicit about stopping
@@ -3248,12 +3280,38 @@ Previous request: {prompt}
 
                 for i, action in enumerate(actions):
                     # Create a hash of this action to detect duplicates
-                    action_hash = f"{action.get('tool')}:{action.get('parameters', {})}"
-                    if action_hash in executed_action_hashes:
-                        if output_mode_manager.verbose:
-                            print(f"[Skipping duplicate action] {action_hash[:80]}")
-                        continue
-                    executed_action_hashes.add(action_hash)
+                    # Only track write/edit/delete operations - reads are safe to repeat
+                    tool_name = action.get("tool", "unknown")
+                    is_write_operation = tool_name in ["write_file", "edit_file", "delete_file", "create_file"]
+
+                    if is_write_operation:
+                        action_hash = f"{tool_name}:{action.get('parameters', {}).get('filepath', 'unknown')}"
+                        if action_hash in executed_action_hashes:
+                            if output_mode_manager.verbose:
+                                print(f"[Skipping duplicate action] {action_hash[:80]}")
+                            # Inform LLM that this file/folder already exists
+                            filepath = action.get('parameters', {}).get('filepath', 'unknown')
+                            print(f"\n[Info] File/folder '{filepath}' was already modified in this session.")
+                            print("[Info] If you need to modify it further, provide new content or a different approach.\n")
+                            continue
+                        executed_action_hashes.add(action_hash)
+                    # For read operations (list_directory, read_file), don't track as duplicates
+
+                    # Pre-check: Verify file exists before read_file
+                    if action.get("tool") == "read_file":
+                        filepath = action.get("parameters", {}).get("filepath", "")
+                        if filepath and not os.path.exists(filepath):
+                            # Get list of similar files to suggest
+                            dir_path = os.path.dirname(filepath) or "."
+                            try:
+                                available = [f for f in os.listdir(dir_path) if os.path.isfile(os.path.join(dir_path, f))]
+                                print(f"\n[Warning] File '{filepath}' does not exist.")
+                                print(f"[Hint] Available files in {dir_path}: {', '.join(available[:10])}")
+                            except:
+                                print(f"\n[Warning] File '{filepath}' does not exist.")
+                            # Skip this action and inform LLM
+                            batch_results.append({"skipped": True, "reason": "File not found", "filepath": filepath})
+                            continue
 
                     # Check permission for file operations (Claude-like)
                     if action.get("tool") in ["write_file", "edit_file", "delete_file"]:
@@ -3328,6 +3386,11 @@ Previous request: {prompt}
                     if output_mode_manager.verbose:
                         print("[No actions succeeded. Stopping.]")
                     break
+
+            # Clear the duplicate action hashes after task completes
+            # This allows new prompts to create files with same names if needed
+            executed_action_hashes.clear()
+            print("[Info] Task completed. Action history cleared for next prompt.")
 
             result = {
                 "actions_executed": total_successful,
